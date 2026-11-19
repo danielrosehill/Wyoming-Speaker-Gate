@@ -47,6 +47,35 @@ Recording 60 s from a PipeWire/PulseAudio mic:
 | `--min-speech` | 0.6 | seconds of voiced audio needed to judge; shorter is rejected unless `--allow-short` |
 | `--log-file` | `/data/decisions.jsonl` in compose | one JSON line per utterance: scores, decision, latency |
 | `--log-text` | off | add the transcript to the log |
+| `--save-audio DIR` | off | debug: keep every utterance as a WAV |
+| `--speaker-webhook URL` | off | POST `{"speaker", "best", "score", "pass"}` as JSON after each decision, before the transcript is returned (1.5 s timeout, failures only logged). Lets the consumer know who is speaking |
+
+### Addressing the speaker by name (Home Assistant)
+
+With `--speaker-webhook http://HA:8123/api/webhook/speaker_gate_decision`, a trigger-based template sensor stores the
+latest speaker, and the conversation agent's prompt reads it:
+
+```yaml
+template:
+  - triggers:
+      - trigger: webhook
+        webhook_id: speaker_gate_decision
+        local_only: true
+        allowed_methods: [POST]
+    sensor:
+      - name: Voice last speaker
+        unique_id: voice_last_speaker
+        state: "{{ trigger.json.speaker if trigger.json.speaker else 'unknown' }}"
+        attributes:
+          at: "{{ now().isoformat() }}"
+```
+
+In the LLM prompt (templates render on every turn), only trust it when fresh, since typed requests never pass the gate:
+
+```jinja
+{% set s = states.sensor.voice_last_speaker %}{% if s and s.state not in ['unknown', 'unavailable']
+   and (now() - as_datetime(s.attributes.at)).total_seconds() < 30 %}{{ s.state }} is speaking.{% else %}Speaker unknown.{% endif %}
+```
 
 Several voiceprints per person are allowed (enroll again without `--replace`, e.g. one per room mic); the best one counts.
 

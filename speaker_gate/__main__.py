@@ -53,6 +53,17 @@ class Gate:
                 "score": round(scores[best], 3), "scores": {k: round(v, 3) for k, v in scores.items()}, "pass": ok}
 
 
+def post_speaker(url: str, payload: dict) -> None:
+    """POST the decision as JSON; best effort, 1.5 s timeout, never blocks the transcript for long."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=1.5).close()
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("speaker webhook failed: %r", e)
+
+
 class Handler(AsyncEventHandler):
     def __init__(self, gate: Gate, *a, **kw) -> None:
         super().__init__(*a, **kw)
@@ -138,6 +149,11 @@ class Handler(AsyncEventHandler):
             if self.gate.args.log_file:
                 with open(self.gate.args.log_file, "a") as f:
                     f.write(json.dumps(rec) + "\n")
+            if self.gate.args.speaker_webhook:
+                # tell the consumer (e.g. a Home Assistant webhook automation) who spoke, before it gets the
+                # transcript, so its conversation agent can address the speaker by name
+                await loop.run_in_executor(None, post_speaker, self.gate.args.speaker_webhook,
+                                           {k: d.get(k) for k in ("speaker", "best", "score", "pass")})
             await self.write_event(Transcript(text=out).event())
             return False
         return True
@@ -161,6 +177,9 @@ async def main() -> None:
     ap.add_argument("--log-file", type=Path)
     ap.add_argument("--log-text", action="store_true", help="include transcripts in the log")
     ap.add_argument("--save-audio", type=Path, help="debug: save every utterance as WAV in this directory")
+    ap.add_argument("--speaker-webhook", metavar="URL",
+                    help="POST {speaker, best, score, pass} as JSON to this URL after each decision, "
+                         "before the transcript is returned (e.g. a Home Assistant webhook)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
