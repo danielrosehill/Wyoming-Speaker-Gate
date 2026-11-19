@@ -128,6 +128,12 @@ class Handler(AsyncEventHandler):
                    "mode": self.gate.args.mode, "latency_s": round(time.monotonic() - self.t0, 2)}
             if self.gate.args.log_text:
                 rec["text"] = text
+            if self.gate.args.save_audio:
+                import soundfile as sf
+                self.gate.args.save_audio.mkdir(parents=True, exist_ok=True)
+                fn = self.gate.args.save_audio / (time.strftime("%Y%m%dT%H%M%S") + ("-pass" if d["pass"] else "-block") + ".wav")
+                sf.write(fn, audio, SR)
+                rec["audio_file"] = fn.name
             _LOG.info(json.dumps(rec))
             if self.gate.args.log_file:
                 with open(self.gate.args.log_file, "a") as f:
@@ -154,6 +160,7 @@ async def main() -> None:
     ap.add_argument("--name", default="speaker-gate")
     ap.add_argument("--log-file", type=Path)
     ap.add_argument("--log-text", action="store_true", help="include transcripts in the log")
+    ap.add_argument("--save-audio", type=Path, help="debug: save every utterance as WAV in this directory")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
