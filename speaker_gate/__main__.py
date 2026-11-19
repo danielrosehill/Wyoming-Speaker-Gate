@@ -121,7 +121,10 @@ class Handler(AsyncEventHandler):
             d = await decision_f
             enforce = self.gate.args.mode == "enforce"
             out = text if (d["pass"] or not enforce) else ""
-            rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "audio_s": round(len(audio) / SR, 2), **d,
+            peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+            rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
+            rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "audio_s": round(len(audio) / SR, 2),
+                   "peak_dbfs": round(20 * np.log10(peak + 1e-9), 1), "rms_dbfs": round(20 * np.log10(rms + 1e-9), 1), **d,
                    "mode": self.gate.args.mode, "latency_s": round(time.monotonic() - self.t0, 2)}
             if self.gate.args.log_text:
                 rec["text"] = text
