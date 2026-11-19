@@ -1,0 +1,40 @@
+name: speaker-gate
+
+# Wyoming speaker gate in front of an existing Wyoming STT. Settings in .env (see .env.example).
+services:
+  speaker-gate:
+    build: .
+    image: wyoming-speaker-gate:local
+    container_name: speaker-gate
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Jerusalem
+    ports:
+      - "${BIND:-0.0.0.0}:${PORT:-10310}:10310"
+    volumes:
+      - ./data:/data
+    command: >-
+      --uri tcp://0.0.0.0:10310
+      --upstream ${UPSTREAM}
+      --voiceprints /data/voiceprints.npz
+      --threshold ${THRESHOLD:-0.40}
+      ${SPEAKER_THRESHOLDS:-}
+      --mode ${MODE:-enforce}
+      --log-file /data/decisions.jsonl
+      ${EXTRA_ARGS:-}
+    mem_limit: 3g
+    cpus: 4
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 10310), 2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks: [default]
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${SUBNET:-172.16.60.0/24}
