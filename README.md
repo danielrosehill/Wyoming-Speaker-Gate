@@ -56,6 +56,7 @@ Recording 60 s from a PipeWire/PulseAudio mic:
 | `--stt-language` / `STT_LANGUAGE` | en | ISO-639-1; empty = auto-detect |
 | `--stt-prompt-file` / `STT_PROMPT_FILE` | `/data/stt-prompt.txt` in compose | Whisper vocabulary prompt, re-read on every command |
 | `--stt-timeout` / `STT_TIMEOUT_S` | 4 | seconds to wait for OpenRouter before returning the upstream transcript |
+| `--upstream-timeout` / `UPSTREAM_TIMEOUT_S` | 3 | seconds per upstream step (connect, each send, transcript after end of audio); on timeout or error the command carries on without the upstream |
 | `--speaker-webhook URL` | off | POST `{"speaker", "best", "score", "pass"}` as JSON after each decision, before the transcript is returned (1.5 s timeout, failures only logged). Lets the consumer know who is speaking |
 
 ### STT routing: OpenRouter Whisper with upstream fallback
@@ -88,6 +89,13 @@ Measured 2026-11-20 from an Israeli home server, 3-4 s clips, `language=en`, wit
 Hence the default: large-v3 with provider order Together, then Groq. Without a provider order OpenRouter picked
 DeepInfra for some calls, which ignored the prompt and took several seconds. Price is per second of audio, about $0.03 to
 $0.11 per hour depending on provider: a few cents a month for a household.
+
+A hung or dead upstream never hangs a command: each upstream step (connect, sending audio, waiting for the
+transcript after end of audio) is limited to `UPSTREAM_TIMEOUT_S` (3 s); on timeout or error the gate drops the
+upstream for that command and logs `upstream_error` (`timeout` or the exception). With OpenRouter primary,
+the gate waits at most that long for the shadow and returns Whisper's text. If both engines fail, the transcript
+is empty (`stt_used: none`), so Home Assistant ends the pipeline with "no text recognized" instead of waiting.
+Worst case per command is therefore about `max(STT_TIMEOUT_S, UPSTREAM_TIMEOUT_S)` after end of speech.
 
 To go back to the upstream only: `STT_PRIMARY=upstream` in `.env`, then `docker compose up -d`.
 

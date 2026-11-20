@@ -179,19 +179,46 @@ class Handler(AsyncEventHandler):
         self.buf = bytearray()
         self.t0 = 0.0
         self.wall0 = 0.0
+        self.up_err: str | None = None
+
+    async def _up(self, coro) -> bool:
+        """Run one upstream step with the upstream timeout. On failure drop the upstream connection for the rest
+        of this command (the command goes on without the upstream) and remember why."""
+        try:
+            await asyncio.wait_for(coro, self.gate.args.upstream_timeout)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.up_err = "timeout" if isinstance(e, asyncio.TimeoutError) else repr(e)
+            _LOG.warning("upstream STT failed: %s", self.up_err)
+            await self._drop_upstream()
+            return False
+
+    async def _drop_upstream(self) -> None:
+        c, self.client = self.client, None
+        if c is not None:
+            try:
+                await asyncio.wait_for(c.disconnect(), 1.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _connect_upstream(self, first: Event) -> None:
+        self.client = AsyncClient.from_uri(self.gate.args.upstream)
+        if await self._up(self.client.connect()):
+            await self._up(self.client.write_event(first))
 
     async def _upstream_info(self) -> Info:
         async with self.gate.lock:
             if self.gate.info is None:
-                async with AsyncClient.from_uri(self.gate.args.upstream) as c:
-                    await c.write_event(Describe().event())
-                    while True:
-                        ev = await c.read_event()
-                        if ev is None:
-                            raise ConnectionError("upstream closed during describe")
-                        if Info.is_type(ev.type):
-                            info = Info.from_event(ev)
-                            break
+                async def _describe() -> Info:
+                    async with AsyncClient.from_uri(self.gate.args.upstream) as c:
+                        await c.write_event(Describe().event())
+                        while True:
+                            ev = await c.read_event()
+                            if ev is None:
+                                raise ConnectionError("upstream closed during describe")
+                            if Info.is_type(ev.type):
+                                return Info.from_event(ev)
+                info = await asyncio.wait_for(_describe(), self.gate.args.upstream_timeout)
                 for prog in info.asr:
                     prog.name = f"{self.gate.args.name} ({prog.name})"
                     prog.description = f"Speaker-gated: {prog.description or prog.name}"
@@ -203,23 +230,21 @@ class Handler(AsyncEventHandler):
             await self.write_event((await self._upstream_info()).event())
             return True
         if Transcribe.is_type(event.type):
-            self.client = AsyncClient.from_uri(self.gate.args.upstream)
-            await self.client.connect()
-            await self.client.write_event(event)
+            self.up_err = None
+            await self._connect_upstream(event)
             return True
         if AudioStart.is_type(event.type):
-            if self.client is None:  # no Transcribe sent first
-                self.client = AsyncClient.from_uri(self.gate.args.upstream)
-                await self.client.connect()
-                await self.client.write_event(Transcribe().event())
+            if self.client is None and self.up_err is None:  # no Transcribe sent first
+                await self._connect_upstream(Transcribe().event())
             self.buf.clear(); self.t0 = time.monotonic(); self.wall0 = time.time()
-            await self.client.write_event(event)
+            if self.client:
+                await self._up(self.client.write_event(event))
             return True
         if AudioChunk.is_type(event.type):
             chunk = AudioChunk.from_event(event)
             self.buf += self.conv.convert(chunk).audio
             if self.client:
-                await self.client.write_event(event)
+                await self._up(self.client.write_event(event))
             return True
         if AudioStop.is_type(event.type):
             audio = np.frombuffer(bytes(self.buf), dtype=np.int16).astype(np.float32) / 32768.0
@@ -239,25 +264,25 @@ class Handler(AsyncEventHandler):
             up_text = ""
             if self.client:
                 t_up = time.monotonic()
-                try:
+                got: list[str] = []
+
+                async def _finish() -> None:
                     await self.client.write_event(event)
                     while True:
                         ev = await self.client.read_event()
                         if ev is None:
-                            break
+                            raise ConnectionError("upstream closed without a transcript")
                         if Transcript.is_type(ev.type):
-                            up_text = Transcript.from_event(ev).text
-                            break
-                except Exception as e:  # noqa: BLE001
-                    _LOG.warning("upstream STT failed: %r", e)
-                    stt["upstream_error"] = repr(e)
+                            got.append(Transcript.from_event(ev).text)
+                            return
+                if await self._up(_finish()):
+                    up_text = got[0]
                 stt["stt_ms_upstream"] = round((time.monotonic() - t_up) * 1000)
-                try:
-                    await self.client.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
-                self.client = None
-            text, stt["stt_used"] = up_text, "upstream"
+                await self._drop_upstream()
+            if self.up_err:
+                stt["upstream_error"] = self.up_err
+            self.up_err = None
+            text, stt["stt_used"] = up_text, ("none" if "upstream_error" in stt else "upstream")
             if or_task is not None:
                 stt["text_upstream"] = up_text
                 try:
@@ -266,6 +291,8 @@ class Handler(AsyncEventHandler):
                 except Exception as e:  # noqa: BLE001 - timeout or HTTP error: fall back to the upstream
                     _LOG.warning("OpenRouter STT failed, using upstream: %r", e)
                     stt["openrouter_error"] = repr(e) if not isinstance(e, asyncio.TimeoutError) else "timeout"
+                    if "upstream_error" in stt:
+                        _LOG.warning("both STT engines failed: returning an empty transcript")
             stt["stt_primary"] = "openrouter" if self.gate.openrouter else "upstream"
             d = await decision_f
             enforce = self.gate.args.mode == "enforce"
@@ -336,6 +363,9 @@ async def main() -> None:
                     help="vocabulary prompt for Whisper, re-read each call (env STT_PROMPT_FILE)")
     ap.add_argument("--stt-timeout", type=float, default=float(os.environ.get("STT_TIMEOUT_S") or 4.0),
                     help="seconds to wait for OpenRouter before using the upstream transcript")
+    ap.add_argument("--upstream-timeout", type=float, default=float(os.environ.get("UPSTREAM_TIMEOUT_S") or 3.0),
+                    help="seconds per upstream step (connect, send, transcript after end of audio); on timeout the "
+                         "command continues without the upstream (env UPSTREAM_TIMEOUT_S)")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
