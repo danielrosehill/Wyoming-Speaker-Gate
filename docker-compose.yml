@@ -12,6 +12,8 @@ services:
       - TZ=Asia/Jerusalem
       # keep every command's audio for replay/STT A/B tests; RECORD=0 in .env disables it
       - RECORD_DIR=/data/recordings
+      # vocabulary prompt for the OpenRouter Whisper STT (see stt-prompt.example.txt)
+      - STT_PROMPT_FILE=/data/stt-prompt.txt
     ports:
       - "${BIND:-0.0.0.0}:${PORT:-10310}:10310"
     volumes:

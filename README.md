@@ -50,7 +50,46 @@ Recording 60 s from a PipeWire/PulseAudio mic:
 | `--record-dir DIR` / `RECORD_DIR` | `/data/recordings` in compose, off otherwise | keep every command as WAV + JSON (see [Recordings](#recordings)); `--save-audio` is an alias |
 | `--no-record` / `RECORD=0` | recording on | turn recording off without removing the directory setting |
 | `--record-retention-days` / `RECORD_RETENTION_DAYS` | 7 | day folders older than this are deleted |
+| `--stt-primary` / `STT_PRIMARY` | openrouter | `openrouter`: Whisper via OpenRouter, the upstream in parallel as shadow and fallback; `upstream`: upstream only (see [STT routing](#stt-routing-openrouter-whisper-with-upstream-fallback)) |
+| `--openrouter-model` / `OPENROUTER_STT_MODEL` | `openai/whisper-large-v3` | needs `OPENROUTER_API_KEY` in `.env`; without it the gate uses the upstream only |
+| `--openrouter-providers` / `OPENROUTER_STT_PROVIDERS` | `Together,Groq` | provider order; empty = OpenRouter's choice |
+| `--stt-language` / `STT_LANGUAGE` | en | ISO-639-1; empty = auto-detect |
+| `--stt-prompt-file` / `STT_PROMPT_FILE` | `/data/stt-prompt.txt` in compose | Whisper vocabulary prompt, re-read on every command |
+| `--stt-timeout` / `STT_TIMEOUT_S` | 4 | seconds to wait for OpenRouter before returning the upstream transcript |
 | `--speaker-webhook URL` | off | POST `{"speaker", "best", "score", "pass"}` as JSON after each decision, before the transcript is returned (1.5 s timeout, failures only logged). Lets the consumer know who is speaking |
+
+### STT routing: OpenRouter Whisper with upstream fallback
+
+With `STT_PRIMARY=openrouter` (default) and an `OPENROUTER_API_KEY`, each command goes to two engines at once:
+the upstream Wyoming STT (streamed as before) and Whisper on OpenRouter (`POST /api/v1/audio/transcriptions`,
+JSON body with the 16 kHz WAV base64-encoded, `language`, `prompt`, `provider.order`). The OpenRouter text is
+returned; on an HTTP error or after `STT_TIMEOUT_S` the upstream text is returned instead. The upstream stays
+the Wyoming backend Home Assistant sees, so the HA entity keeps its name (`stt.speaker_gate_<upstream name>`).
+
+Logged per command (decisions.jsonl and the recording sidecar): `stt_primary` (configured), `stt_used`
+(`openrouter` or `upstream`), `text_openrouter`, `text_upstream`, `stt_ms_openrouter`, `stt_ms_upstream`,
+`openrouter_error`/`upstream_error` when one failed. `text` is the transcript used. In decisions.jsonl the
+transcripts only appear with `--log-text`; the sidecar always has them.
+
+Vocabulary prompt: a text file (`data/stt-prompt.txt` in compose, see `stt-prompt.example.txt`) of names and rare
+words, comma-separated. Whisper uses it as preceding context, which biases spelling of those words. It is re-read on
+every command, so edit it without restarting.
+
+Measured 2026-11-20 from an Israeli home server, 3-4 s clips, `language=en`, with a prompt:
+
+| model / provider | latency | prompt honoured? |
+|---|---|---|
+| whisper-large-v3 / Together | 0.8-1.2 s | yes ("Log a dose of Omeprazole and Vector Plus") |
+| whisper-large-v3 / Groq | ~0.4 s | partly ("Omprazole and Vector Plus") |
+| whisper-large-v3 / DeepInfra | 2.2-4.2 s | no ("Omprozole in VectorPlus") |
+| whisper-large-v3-turbo / Groq, DeepInfra | 0.35-1.4 s | partly / no |
+| whisper-1 (OpenAI) | 0.8-2.9 s | yes |
+
+Hence the default: large-v3 with provider order Together, then Groq. Without a provider order OpenRouter picked
+DeepInfra for some calls, which ignored the prompt and took several seconds. Price is per second of audio, about $0.03 to
+$0.11 per hour depending on provider: a few cents a month for a household.
+
+To go back to the upstream only: `STT_PRIMARY=upstream` in `.env`, then `docker compose up -d`.
 
 ### Recordings
 

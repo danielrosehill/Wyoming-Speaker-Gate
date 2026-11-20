@@ -39,6 +39,15 @@ class Gate:
             self.thresholds[n] = float(t)
         self.info: Info | None = None
         self.lock = asyncio.Lock()
+        key = os.environ.get("OPENROUTER_API_KEY", "")
+        self.openrouter = None
+        if args.stt_primary == "openrouter":
+            if key:
+                self.openrouter = OpenRouterSTT(key, args.openrouter_model,
+                                                [p for p in args.openrouter_providers.split(",") if p.strip()],
+                                                args.stt_language or None, args.stt_prompt_file)
+            else:
+                _LOG.warning("STT_PRIMARY=openrouter but OPENROUTER_API_KEY is empty: using the upstream only")
         self.recorder = (Recorder(args.record_dir, args.record_retention_days)
                          if args.record_dir and args.record else None)
         _LOG.info("voiceprints %s, thresholds %s, mode %s", self.names, self.thresholds, args.mode)
@@ -108,6 +117,48 @@ class Recorder:
             _LOG.warning("recording failed: %r", e)
 
 
+class OpenRouterSTT:
+    """Whisper via OpenRouter's /audio/transcriptions (JSON body, base64 WAV). The vocabulary prompt is re-read from
+    prompt_file on every call, so it can be edited without a restart."""
+
+    URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+    def __init__(self, key: str, model: str, providers: list[str], language: str | None,
+                 prompt_file: Path | None) -> None:
+        self.key, self.model, self.providers, self.language, self.prompt_file = key, model, providers, language, prompt_file
+        _LOG.info("primary STT: OpenRouter %s via %s, language %s, prompt file %s", model, providers or "any provider",
+                  language, prompt_file)
+
+    def prompt(self) -> str:
+        try:
+            if self.prompt_file and self.prompt_file.is_file():
+                lines = [ln.strip() for ln in self.prompt_file.read_text().splitlines()]
+                return " ".join(ln for ln in lines if ln and not ln.startswith("#"))
+        except OSError as e:
+            _LOG.warning("prompt file unreadable: %r", e)
+        return ""
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        import base64
+        import io
+        import urllib.request
+
+        import soundfile as sf
+        b = io.BytesIO()
+        sf.write(b, audio, SR, subtype="PCM_16", format="WAV")
+        body: dict = {"model": self.model, "input_audio": {"data": base64.b64encode(b.getvalue()).decode(), "format": "wav"}}
+        if self.language:
+            body["language"] = self.language
+        if pr := self.prompt():
+            body["prompt"] = pr
+        if self.providers:
+            body["provider"] = {"order": self.providers}  # fallbacks to other providers stay allowed
+        req = urllib.request.Request(self.URL, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return (json.load(r).get("text") or "").strip()
+
+
 def post_speaker(url: str, payload: dict) -> None:
     """POST the decision as JSON; best effort, 1.5 s timeout, never blocks the transcript for long."""
     import urllib.request
@@ -174,17 +225,48 @@ class Handler(AsyncEventHandler):
             audio = np.frombuffer(bytes(self.buf), dtype=np.int16).astype(np.float32) / 32768.0
             loop = asyncio.get_running_loop()
             decision_f = loop.run_in_executor(None, self.gate.decide, audio)
-            text = ""
+            stt: dict = {}
+            or_task = None
+            if self.gate.openrouter and len(audio):
+                async def _or() -> str:
+                    t = time.monotonic()
+                    try:
+                        return await asyncio.wait_for(loop.run_in_executor(None, self.gate.openrouter.transcribe, audio),
+                                                      self.gate.args.stt_timeout)
+                    finally:
+                        stt["stt_ms_openrouter"] = round((time.monotonic() - t) * 1000)
+                or_task = asyncio.ensure_future(_or())
+            up_text = ""
             if self.client:
-                await self.client.write_event(event)
-                while True:
-                    ev = await self.client.read_event()
-                    if ev is None:
-                        break
-                    if Transcript.is_type(ev.type):
-                        text = Transcript.from_event(ev).text
-                        break
-                await self.client.disconnect(); self.client = None
+                t_up = time.monotonic()
+                try:
+                    await self.client.write_event(event)
+                    while True:
+                        ev = await self.client.read_event()
+                        if ev is None:
+                            break
+                        if Transcript.is_type(ev.type):
+                            up_text = Transcript.from_event(ev).text
+                            break
+                except Exception as e:  # noqa: BLE001
+                    _LOG.warning("upstream STT failed: %r", e)
+                    stt["upstream_error"] = repr(e)
+                stt["stt_ms_upstream"] = round((time.monotonic() - t_up) * 1000)
+                try:
+                    await self.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.client = None
+            text, stt["stt_used"] = up_text, "upstream"
+            if or_task is not None:
+                stt["text_upstream"] = up_text
+                try:
+                    stt["text_openrouter"] = await or_task
+                    text, stt["stt_used"] = stt["text_openrouter"], "openrouter"
+                except Exception as e:  # noqa: BLE001 - timeout or HTTP error: fall back to the upstream
+                    _LOG.warning("OpenRouter STT failed, using upstream: %r", e)
+                    stt["openrouter_error"] = repr(e) if not isinstance(e, asyncio.TimeoutError) else "timeout"
+            stt["stt_primary"] = "openrouter" if self.gate.openrouter else "upstream"
             d = await decision_f
             enforce = self.gate.args.mode == "enforce"
             out = text if (d["pass"] or not enforce) else ""
@@ -192,13 +274,15 @@ class Handler(AsyncEventHandler):
             rms = float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
             rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "audio_s": round(len(audio) / SR, 2),
                    "peak_dbfs": round(20 * np.log10(peak + 1e-9), 1), "rms_dbfs": round(20 * np.log10(rms + 1e-9), 1), **d,
-                   "mode": self.gate.args.mode, "latency_s": round(time.monotonic() - self.t0, 2)}
+                   "mode": self.gate.args.mode, "latency_s": round(time.monotonic() - self.t0, 2), **stt}
             if self.gate.args.log_text:
                 rec["text"] = text
+            else:
+                rec.pop("text_upstream", None); rec.pop("text_openrouter", None)
             if self.gate.recorder:
                 wav = self.gate.recorder.path_for(self.wall0 or time.time(), d.get("speaker"))
                 rec["audio_file"] = str(wav.relative_to(self.gate.recorder.root))
-                meta = {**rec, "text": text, "returned_text": out, "sample_rate": SR}
+                meta = {**rec, **stt, "text": text, "returned_text": out, "sample_rate": SR}
                 await loop.run_in_executor(None, self.gate.recorder.write, wav, audio, meta)
             _LOG.info(json.dumps(rec))
             if self.gate.args.log_file:
@@ -240,6 +324,18 @@ async def main() -> None:
     ap.add_argument("--speaker-webhook", metavar="URL",
                     help="POST {speaker, best, score, pass} as JSON to this URL after each decision, "
                          "before the transcript is returned (e.g. a Home Assistant webhook)")
+    ap.add_argument("--stt-primary", choices=["openrouter", "upstream"],
+                    default=os.environ.get("STT_PRIMARY") or "openrouter",
+                    help="openrouter = Whisper via OpenRouter (needs OPENROUTER_API_KEY), upstream transcribes in "
+                         "parallel as shadow and fallback; upstream = upstream only (env STT_PRIMARY)")
+    ap.add_argument("--openrouter-model", default=os.environ.get("OPENROUTER_STT_MODEL") or "openai/whisper-large-v3")
+    ap.add_argument("--openrouter-providers", default=os.environ.get("OPENROUTER_STT_PROVIDERS", "Together,Groq"),
+                    help="comma-separated provider order (env OPENROUTER_STT_PROVIDERS; empty = OpenRouter's choice)")
+    ap.add_argument("--stt-language", default=os.environ.get("STT_LANGUAGE", "en"), help="ISO-639-1; empty = auto")
+    ap.add_argument("--stt-prompt-file", type=Path, default=os.environ.get("STT_PROMPT_FILE") or None,
+                    help="vocabulary prompt for Whisper, re-read each call (env STT_PROMPT_FILE)")
+    ap.add_argument("--stt-timeout", type=float, default=float(os.environ.get("STT_TIMEOUT_S") or 4.0),
+                    help="seconds to wait for OpenRouter before using the upstream transcript")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

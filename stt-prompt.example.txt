@@ -1,0 +1,4 @@
+# Vocabulary prompt for Whisper (OpenRouter primary STT). Lines are joined with spaces; lines starting with # are
+# ignored. Re-read on every command, so edits apply without a restart. Copy to data/stt-prompt.txt.
+# Whisper treats this as "preceding text": a comma-separated list of names and rare words works best.
+Hey Jarvis, Alice, Bob, Ventolin, Omeprazole, puffs, Shabbat, Todoist.
