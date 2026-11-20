@@ -47,8 +47,56 @@ Recording 60 s from a PipeWire/PulseAudio mic:
 | `--min-speech` | 0.6 | seconds of voiced audio needed to judge; shorter is rejected unless `--allow-short` |
 | `--log-file` | `/data/decisions.jsonl` in compose | one JSON line per utterance: scores, decision, latency |
 | `--log-text` | off | add the transcript to the log |
-| `--save-audio DIR` | off | debug: keep every utterance as a WAV |
+| `--record-dir DIR` / `RECORD_DIR` | `/data/recordings` in compose, off otherwise | keep every command as WAV + JSON (see [Recordings](#recordings)); `--save-audio` is an alias |
+| `--no-record` / `RECORD=0` | recording on | turn recording off without removing the directory setting |
+| `--record-retention-days` / `RECORD_RETENTION_DAYS` | 7 | day folders older than this are deleted |
 | `--speaker-webhook URL` | off | POST `{"speaker", "best", "score", "pass"}` as JSON after each decision, before the transcript is returned (1.5 s timeout, failures only logged). Lets the consumer know who is speaking |
+
+### Recordings
+
+On by default in the compose setup, so STT failures can be replayed and A/B tested against other STT engines.
+For every command the gate receives (wake word to end of VAD, exactly what the upstream STT got, after conversion
+to 16 kHz mono 16-bit) it writes:
+
+```
+data/recordings/YYYY-MM-DD/YYYYMMDDTHHMMSS-mmm_<Speaker|unknown>.wav
+data/recordings/YYYY-MM-DD/YYYYMMDDTHHMMSS-mmm_<Speaker|unknown>.json
+```
+
+- Timestamp = local time (container `TZ`) the audio started; `<Speaker>` is the accepted voiceprint name, `unknown`
+  when none passed its threshold (or the clip was too short to judge).
+- The `.json` holds the decision-log record (`ts`, `audio_s`, levels, `speaker`, `best`, `score`, `scores`, `pass`,
+  `mode`, `latency_s`) plus `text` (the upstream transcript, always), `returned_text` (what the gate passed on; empty
+  if blocked) and `audio_file`. The same `audio_file` (relative to `data/recordings/`) is added to the
+  `decisions.jsonl` line.
+- Retention: day folders older than `RECORD_RETENTION_DAYS` (default 7) are deleted at startup and on the first
+  write of each day. Only folders named `YYYY-MM-DD` are touched.
+- Disable: `RECORD=0` in `.env`, then `docker compose up -d`. Existing files stay until you delete them.
+- Writing failures are logged and never block the transcript. Roughly 32 KB per second of audio.
+
+Replay a recording through any Wyoming STT (e.g. to compare engines):
+
+```bash
+uv run --with wyoming python - tcp://HOST:10300 data/recordings/2026-11-20/20261120T204307-123_Daniel.wav <<'PY'
+import asyncio, sys, wave
+from wyoming.asr import Transcribe, Transcript
+from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.client import AsyncClient
+async def main(uri, path):
+    with wave.open(path) as w:
+        rate, width, ch, pcm = w.getframerate(), w.getsampwidth(), w.getnchannels(), w.readframes(w.getnframes())
+    async with AsyncClient.from_uri(uri) as c:
+        await c.write_event(Transcribe().event())
+        await c.write_event(AudioStart(rate=rate, width=width, channels=ch).event())
+        for i in range(0, len(pcm), 2048):
+            await c.write_event(AudioChunk(rate=rate, width=width, channels=ch, audio=pcm[i:i + 2048]).event())
+        await c.write_event(AudioStop().event())
+        while (ev := await c.read_event()) and not Transcript.is_type(ev.type):
+            pass
+        print(Transcript.from_event(ev).text if ev else "(no transcript)")
+asyncio.run(main(*sys.argv[1:]))
+PY
+```
 
 ### Addressing the speaker by name (Home Assistant)
 

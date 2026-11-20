@@ -7,7 +7,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import re
+import shutil
 import time
+from datetime import date, timedelta
 from functools import partial
 from pathlib import Path
 
@@ -35,6 +39,8 @@ class Gate:
             self.thresholds[n] = float(t)
         self.info: Info | None = None
         self.lock = asyncio.Lock()
+        self.recorder = (Recorder(args.record_dir, args.record_retention_days)
+                         if args.record_dir and args.record else None)
         _LOG.info("voiceprints %s, thresholds %s, mode %s", self.names, self.thresholds, args.mode)
 
     def decide(self, audio: np.ndarray) -> dict:
@@ -51,6 +57,55 @@ class Gate:
         ok = scores[best] >= self.thresholds[best]
         return {"speech_s": round(dur, 2), "speaker": best if ok else None, "best": best,
                 "score": round(scores[best], 3), "scores": {k: round(v, 3) for k, v in scores.items()}, "pass": ok}
+
+
+def _env_on(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    return default if v is None or v.strip() == "" else v.strip().lower() not in ("0", "false", "no", "off")
+
+
+class Recorder:
+    """Keeps each command's audio as 16 kHz mono WAV plus a sidecar JSON (decision, scores, transcript) in
+    <dir>/YYYY-MM-DD/<YYYYMMDDTHHMMSS-mmm>_<speaker|unknown>.wav/.json; day folders older than retention_days
+    are deleted on startup and on each write."""
+
+    def __init__(self, root: Path, retention_days: int) -> None:
+        self.root, self.retention_days = root, retention_days
+        self._pruned_on: date | None = None
+        _LOG.info("recording commands to %s, retention %d days", root, retention_days)
+        self.prune()
+
+    def prune(self) -> None:
+        today = date.today()
+        if self._pruned_on == today:
+            return
+        cutoff = today - timedelta(days=self.retention_days)
+        if self.root.is_dir():
+            for d in self.root.iterdir():
+                try:
+                    day = date.fromisoformat(d.name)
+                except ValueError:
+                    continue  # not one of ours
+                if d.is_dir() and day < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    _LOG.info("pruned recordings %s", d)
+        self._pruned_on = today
+
+    def path_for(self, when: float, speaker: str | None) -> Path:
+        lt = time.localtime(when)
+        stem = time.strftime("%Y%m%dT%H%M%S", lt) + f"-{int(when * 1000) % 1000:03d}"
+        who = re.sub(r"[^A-Za-z0-9_-]+", "-", speaker) if speaker else "unknown"
+        return self.root / time.strftime("%Y-%m-%d", lt) / f"{stem}_{who}.wav"
+
+    def write(self, wav: Path, audio: np.ndarray, meta: dict) -> None:
+        import soundfile as sf
+        try:
+            self.prune()
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(wav, audio, SR, subtype="PCM_16")
+            wav.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
+        except Exception as e:  # noqa: BLE001 - recording must never break the pipeline
+            _LOG.warning("recording failed: %r", e)
 
 
 def post_speaker(url: str, payload: dict) -> None:
@@ -72,6 +127,7 @@ class Handler(AsyncEventHandler):
         self.conv = AudioChunkConverter(rate=SR, width=2, channels=1)
         self.buf = bytearray()
         self.t0 = 0.0
+        self.wall0 = 0.0
 
     async def _upstream_info(self) -> Info:
         async with self.gate.lock:
@@ -105,7 +161,7 @@ class Handler(AsyncEventHandler):
                 self.client = AsyncClient.from_uri(self.gate.args.upstream)
                 await self.client.connect()
                 await self.client.write_event(Transcribe().event())
-            self.buf.clear(); self.t0 = time.monotonic()
+            self.buf.clear(); self.t0 = time.monotonic(); self.wall0 = time.time()
             await self.client.write_event(event)
             return True
         if AudioChunk.is_type(event.type):
@@ -139,12 +195,11 @@ class Handler(AsyncEventHandler):
                    "mode": self.gate.args.mode, "latency_s": round(time.monotonic() - self.t0, 2)}
             if self.gate.args.log_text:
                 rec["text"] = text
-            if self.gate.args.save_audio:
-                import soundfile as sf
-                self.gate.args.save_audio.mkdir(parents=True, exist_ok=True)
-                fn = self.gate.args.save_audio / (time.strftime("%Y%m%dT%H%M%S") + ("-pass" if d["pass"] else "-block") + ".wav")
-                sf.write(fn, audio, SR)
-                rec["audio_file"] = fn.name
+            if self.gate.recorder:
+                wav = self.gate.recorder.path_for(self.wall0 or time.time(), d.get("speaker"))
+                rec["audio_file"] = str(wav.relative_to(self.gate.recorder.root))
+                meta = {**rec, "text": text, "returned_text": out, "sample_rate": SR}
+                await loop.run_in_executor(None, self.gate.recorder.write, wav, audio, meta)
             _LOG.info(json.dumps(rec))
             if self.gate.args.log_file:
                 with open(self.gate.args.log_file, "a") as f:
@@ -176,7 +231,12 @@ async def main() -> None:
     ap.add_argument("--name", default="speaker-gate")
     ap.add_argument("--log-file", type=Path)
     ap.add_argument("--log-text", action="store_true", help="include transcripts in the log")
-    ap.add_argument("--save-audio", type=Path, help="debug: save every utterance as WAV in this directory")
+    ap.add_argument("--record-dir", "--save-audio", type=Path, default=os.environ.get("RECORD_DIR") or None,
+                    help="keep every command as WAV + JSON sidecar under DIR/YYYY-MM-DD/ (env RECORD_DIR)")
+    ap.add_argument("--no-record", dest="record", action="store_false", default=_env_on("RECORD", True),
+                    help="disable recording even if --record-dir is set (env RECORD=0)")
+    ap.add_argument("--record-retention-days", type=int, default=int(os.environ.get("RECORD_RETENTION_DAYS") or 7),
+                    help="delete recording day folders older than this (env RECORD_RETENTION_DAYS, default 7)")
     ap.add_argument("--speaker-webhook", metavar="URL",
                     help="POST {speaker, best, score, pass} as JSON to this URL after each decision, "
                          "before the transcript is returned (e.g. a Home Assistant webhook)")
